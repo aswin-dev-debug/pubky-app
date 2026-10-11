@@ -3460,6 +3460,64 @@ describe('usePostInput', () => {
       expect(pasteEvent.preventDefault).not.toHaveBeenCalled();
       expect(mockSetAttachments).not.toHaveBeenCalled();
     });
+    it('converts a pasted raw pubky key into a mention', () => {
+      const validPubky = '8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo';
+      const { result } = renderHook(() => usePostInput({ variant: 'post' }));
+
+      const pasteEvent = mockClipboardEvent({
+        clipboardData: asOpaque<DataTransfer>({
+          items: [],
+          getData: () => validPubky,
+        }),
+        preventDefault: vi.fn(),
+      });
+
+      act(() => {
+        result.current.handlePaste(pasteEvent);
+      });
+
+      expect(pasteEvent.preventDefault).toHaveBeenCalled();
+      expect(mockSetContent).toHaveBeenCalledWith(`pubky${validPubky} `);
+    });
+
+    it('converts a pasted pubky:// URL into a mention', () => {
+      const validPubky = '8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo';
+      const { result } = renderHook(() => usePostInput({ variant: 'post' }));
+
+      const pasteEvent = mockClipboardEvent({
+        clipboardData: asOpaque<DataTransfer>({
+          items: [],
+          getData: () => `pubky://${validPubky}`,
+        }),
+        preventDefault: vi.fn(),
+      });
+
+      act(() => {
+        result.current.handlePaste(pasteEvent);
+      });
+
+      expect(pasteEvent.preventDefault).toHaveBeenCalled();
+      expect(mockSetContent).toHaveBeenCalledWith(`pubky${validPubky} `);
+    });
+
+    it('does not convert a non-key text paste', () => {
+      const { result } = renderHook(() => usePostInput({ variant: 'post' }));
+
+      const pasteEvent = mockClipboardEvent({
+        clipboardData: asOpaque<DataTransfer>({
+          items: [],
+          getData: () => 'hello world',
+        }),
+        preventDefault: vi.fn(),
+      });
+
+      act(() => {
+        result.current.handlePaste(pasteEvent);
+      });
+
+      expect(pasteEvent.preventDefault).not.toHaveBeenCalled();
+      expect(mockSetContent).not.toHaveBeenCalled();
+    });
   });
   describe('mention autocomplete', () => {
     /** A real textarea so the hook can read the live selection, as the composer does */

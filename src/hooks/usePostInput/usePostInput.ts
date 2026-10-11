@@ -29,6 +29,7 @@ import { useUndoRepost } from '@/hooks/useUndoRepost/useUndoRepost';
 import { Logger } from '@/libs/logger/logger';
 import { parseArticleContent } from '@/libs/post/articleContent';
 import { collectAttachmentRefIndexes } from '@/libs/post/articleInlineMedia';
+import { isPubkyIdentifier, stripPubkyPrefix } from '@/libs/utils/utils';
 import { isViewerExcludedWotStream } from '@/models/stream/post/postStream.types';
 import { toast } from '@/molecules/Toaster/toast';
 import { POST_INPUT_PLACEHOLDER, POST_INPUT_VARIANT } from '@/organisms/PostInput/PostInput.constants';
@@ -795,7 +796,25 @@ export function usePostInput({
   }, []);
 
   // Handle paste events - extract files from clipboard
+  // Handle paste events - convert a pasted pubky identifier into a mention, otherwise extract files
   const handlePaste = (e: React.ClipboardEvent) => {
+    // A pasted pubky identifier (raw, `pubky<key>`, `pk:<key>`, or `pubky://<key>`) becomes a mention.
+    // Guard `getData` because tests construct partial ClipboardEvents.
+    const clipboardData = e.clipboardData;
+    const pastedText =
+      clipboardData && typeof clipboardData.getData === 'function' ? (clipboardData.getData('text') ?? '').trim() : '';
+
+    if (pastedText.length > 0) {
+      const withoutUrl = pastedText.startsWith('pubky://') ? pastedText.slice('pubky://'.length) : pastedText;
+      const candidate = stripPubkyPrefix(withoutUrl);
+      if (isPubkyIdentifier(candidate)) {
+        e.preventDefault();
+        handleMentionSelect(candidate);
+        return;
+      }
+    }
+
+    // Existing behavior: extract files from the clipboard
     const items = e.clipboardData?.items;
     if (!items) return;
 
