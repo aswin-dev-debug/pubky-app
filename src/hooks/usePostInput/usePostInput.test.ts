@@ -3518,6 +3518,89 @@ describe('usePostInput', () => {
       expect(pasteEvent.preventDefault).not.toHaveBeenCalled();
       expect(mockSetContent).not.toHaveBeenCalled();
     });
+
+    it('routes the mention through execCommand so the paste is undoable', () => {
+      const validPubky = '8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo';
+      const { result } = renderHook(() => usePostInput({ variant: 'post' }));
+
+      const focus = vi.fn();
+      const setSelectionRange = vi.fn();
+      result.current.textareaRef.current = asOpaque<HTMLTextAreaElement>({
+        selectionStart: 0,
+        selectionEnd: 0,
+        focus,
+        setSelectionRange,
+      });
+
+      // jsdom does not define document.execCommand at all, so vi.spyOn fails. Assign
+      // it directly so the production guard (`typeof document.execCommand === 'function'`)
+      // takes the native-insertion branch. Restore whatever was there afterwards.
+      const doc = document as typeof document & {
+        execCommand?: (cmd: string, ui?: boolean, value?: string) => boolean;
+      };
+      const original = doc.execCommand;
+      const execCommand = vi.fn().mockReturnValue(true);
+      doc.execCommand = execCommand;
+
+      try {
+        const pasteEvent = mockClipboardEvent({
+          clipboardData: asOpaque<DataTransfer>({ items: [], getData: () => validPubky }),
+          preventDefault: vi.fn(),
+        });
+
+        act(() => {
+          result.current.handlePaste(pasteEvent);
+        });
+
+        expect(focus).toHaveBeenCalled();
+        expect(setSelectionRange).toHaveBeenCalledWith(0, 0);
+        expect(execCommand).toHaveBeenCalledWith('insertText', false, `pubky${validPubky} `);
+      } finally {
+        if (original === undefined) {
+          Reflect.deleteProperty(doc, 'execCommand');
+        } else {
+          doc.execCommand = original;
+        }
+      }
+    });
+
+    it('passes selectionStart and selectionEnd to the native insertion', () => {
+      const validPubky = '8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo';
+      const { result } = renderHook(() => usePostInput({ variant: 'post' }));
+
+      const setSelectionRange = vi.fn();
+      result.current.textareaRef.current = asOpaque<HTMLTextAreaElement>({
+        selectionStart: 6,
+        selectionEnd: 11,
+        focus: vi.fn(),
+        setSelectionRange,
+      });
+
+      const doc = document as Document & {
+        execCommand?: (cmd: string, ui?: boolean, value?: string) => boolean;
+      };
+      const original = doc.execCommand;
+      doc.execCommand = vi.fn().mockReturnValue(true);
+
+      try {
+        const pasteEvent = mockClipboardEvent({
+          clipboardData: asOpaque<DataTransfer>({ items: [], getData: () => validPubky }),
+          preventDefault: vi.fn(),
+        });
+
+        act(() => {
+          result.current.handlePaste(pasteEvent);
+        });
+
+        expect(setSelectionRange).toHaveBeenCalledWith(6, 11);
+      } finally {
+        if (original === undefined) {
+          Reflect.deleteProperty(doc, 'execCommand');
+        } else {
+          doc.execCommand = original;
+        }
+      }
+    });
   });
   describe('mention autocomplete', () => {
     /** A real textarea so the hook can read the live selection, as the composer does */

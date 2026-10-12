@@ -23,7 +23,12 @@ import { useCurrentUserProfile } from '@/hooks/useCurrentUserProfile/useCurrentU
 import { useEditAttachments } from '@/hooks/useEditAttachments/useEditAttachments';
 import { useEmojiInsert } from '@/hooks/useEmojiInsert/useEmojiInsert';
 import { useMentionAutocomplete } from '@/hooks/useMentionAutocomplete/useMentionAutocomplete';
-import { getContentWithMention } from '@/hooks/useMentionAutocomplete/useMentionAutocomplete.utils';
+import {
+  buildMentionText,
+  getContentWithMention,
+  insertMentionAtRange,
+  type MentionInsertion,
+} from '@/hooks/useMentionAutocomplete/useMentionAutocomplete.utils';
 import { usePost } from '@/hooks/usePost/usePost';
 import { useUndoRepost } from '@/hooks/useUndoRepost/useUndoRepost';
 import { Logger } from '@/libs/logger/logger';
@@ -223,35 +228,86 @@ export function usePostInput({
   // the end of the value (prefilled content, a programmatic set)
   const mentionCaret = caret ?? content.length;
 
-  // Handle mention selection - writes pubky{userId} over the pattern at the caret
+  // Write a mention insertion into the controlled textarea and put the caret back
+  // after the inserted mention. Used by the autocomplete path and by the paste
+  // fallback when there is no live textarea to hand the edit to the browser.
+  const applyMentionToState = useCallback(
+    (insertion: MentionInsertion) => {
+      setContent(insertion.content);
+      setCaret(insertion.caret);
+      requestAnimationFrame(() => {
+        const element = textareaRef.current;
+        if (!element) return;
+        element.focus();
+        element.setSelectionRange(insertion.caret, insertion.caret);
+      });
+    },
+    [setContent],
+  );
+
+  // Autocomplete selection: writes over the mention pattern the caret sits in.
+  // Keeps the character-limit check because it inserts into an existing mention range
+  // the user is mid-way through typing — exceeding the limit there would silently drop
+  // the edit with no visible feedback.
   const handleMentionSelect = useCallback(
     (userId: string) => {
       const textarea = textareaRef.current;
       const selectionCaret = textarea?.selectionStart ?? mentionCaret;
       const insertion = getContentWithMention(content, selectionCaret, userId);
+      if (insertion.content.length > POST_MAX_CHARACTER_LENGTH) {
+        textarea?.focus();
+        return;
+      }
+      applyMentionToState(insertion);
+    },
+    [content, mentionCaret, applyMentionToState],
+  );
 
-      if (insertion.content.length <= POST_MAX_CHARACTER_LENGTH) {
-        setContent(insertion.content);
-        setCaret(insertion.caret);
+  // Paste handler for a valid pubky key. Two things have to hold:
+  //   1. Selection is honored — the mention replaces [selectionStart, selectionEnd).
+  //   2. The edit is undoable — we go through the browser's native insertion API
+  //      rather than assigning React state, so Ctrl+Z removes the mention and
+  //      restores whatever text the paste overwrote.
+  //
+  // `document.execCommand` is deprecated but is still the only DOM API that both
+  // replaces the current selection and pushes onto the undo stack. `setRangeText`
+  // does not create an undo entry in Chromium, which is why the fallback below is
+  // limited to environments without execCommand (jsdom in tests).
+  const insertPastedMention = useCallback(
+    (userId: string) => {
+      const textarea = textareaRef.current;
 
-        // A controlled value parks the caret at the end of the textarea; put it
-        // back after the inserted mention so the user keeps typing where they were
-        requestAnimationFrame(() => {
-          const element = textareaRef.current;
-          if (!element) return;
-          element.focus();
-          element.setSelectionRange(insertion.caret, insertion.caret);
-        });
+      // No DOM element (tests, or a programmatic call): fall back to a state write.
+      // This path is not undoable but is only reachable outside the browser.
+      if (!textarea) {
+        applyMentionToState(insertMentionAtRange(content, mentionCaret, mentionCaret, userId));
         return;
       }
 
-      // Over the character limit: leave the content alone, just keep the caret in
-      // the textarea for the next edit
-      textarea?.focus();
-    },
-    [content, mentionCaret, setContent],
-  );
+      const start = textarea.selectionStart ?? mentionCaret;
+      const end = textarea.selectionEnd ?? start;
+      const inserted = buildMentionText(content, start, userId);
 
+      textarea.focus();
+      textarea.setSelectionRange(start, end);
+
+      if (typeof document !== 'undefined' && typeof document.execCommand === 'function') {
+        try {
+          if (document.execCommand('insertText', false, inserted)) {
+            return;
+          }
+        } catch {
+          // Some environments stub execCommand with a throwing function; fall through.
+        }
+      }
+
+      // Fallback for environments without execCommand: replace the range in the DOM
+      // and dispatch an input event so React syncs its controlled value.
+      textarea.setRangeText(inserted, start, end, 'end');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    },
+    [content, mentionCaret, applyMentionToState],
+  );
   // Mention autocomplete
   const {
     users: mentionUsers,
@@ -809,7 +865,7 @@ export function usePostInput({
       const candidate = stripPubkyPrefix(withoutUrl);
       if (isPubkyIdentifier(candidate)) {
         e.preventDefault();
-        handleMentionSelect(candidate);
+        insertPastedMention(candidate);
         return;
       }
     }
