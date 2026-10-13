@@ -3601,6 +3601,36 @@ describe('usePostInput', () => {
         }
       }
     });
+    it('does not intercept the paste when the normalized mention would exceed maxLength', () => {
+      const validPubky = '8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo';
+      // Fill the composer so a 58-char `pubky<key> ` cannot fit, but the 55-char
+      // `pk:<key>` form could. 1985 + 58 > 2000, 1985 + 55 = 2040 (still over) —
+      // just needs to be within 58 of the limit.
+      mockContent = 'a'.repeat(1985);
+
+      const { result } = renderHook(() => usePostInput({ variant: 'post' }));
+
+      result.current.textareaRef.current = asOpaque<HTMLTextAreaElement>({
+        selectionStart: 1985,
+        selectionEnd: 1985,
+        maxLength: 2000,
+        focus: vi.fn(),
+        setSelectionRange: vi.fn(),
+      });
+
+      const pasteEvent = mockClipboardEvent({
+        clipboardData: asOpaque<DataTransfer>({ items: [], getData: () => validPubky }),
+        preventDefault: vi.fn(),
+      });
+
+      act(() => {
+        result.current.handlePaste(pasteEvent);
+      });
+
+      // The handler let the native paste happen.
+      expect(pasteEvent.preventDefault).not.toHaveBeenCalled();
+      expect(mockSetContent).not.toHaveBeenCalled();
+    });
   });
   describe('mention autocomplete', () => {
     /** A real textarea so the hook can read the live selection, as the composer does */
