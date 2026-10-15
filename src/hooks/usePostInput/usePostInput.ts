@@ -231,9 +231,6 @@ export function usePostInput({
   // Write a mention insertion into the controlled textarea and put the caret back
   // after the inserted mention. Used by the autocomplete path and by the paste
   // fallback when there is no live textarea to hand the edit to the browser.
-  // Write a mention insertion into the controlled textarea and put the caret back
-  // after the inserted mention. Used by the autocomplete path and by the paste
-  // fallback when there is no live textarea to hand the edit to the browser.
   const applyMentionToState = (insertion: MentionInsertion) => {
     setContent(insertion.content);
     setCaret(insertion.caret);
@@ -860,7 +857,6 @@ export function usePostInput({
     fileInputRef.current?.click();
   }, []);
 
-  // Handle paste events - extract files from clipboard
   // Handle paste events - convert a pasted pubky identifier into a mention, otherwise extract files
   const handlePaste = (e: React.ClipboardEvent) => {
     // A pasted pubky identifier (raw, `pubky<key>`, `pk:<key>`, or `pubky://<key>`) becomes a mention.
