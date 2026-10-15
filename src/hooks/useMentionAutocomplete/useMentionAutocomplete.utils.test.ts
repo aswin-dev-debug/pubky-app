@@ -606,4 +606,11 @@ describe('buildMentionText', () => {
   it('does not double the space when the preceding character is whitespace', () => {
     expect(buildMentionText('hello ', 6, userId)).toBe('pubkyuser123 ');
   });
+  it('does not add a space when the preceding character is a newline', () => {
+    expect(buildMentionText('hello\n', 6, userId)).toBe('pubkyuser123 ');
+  });
+
+  it('does not add a space when the preceding character is a tab', () => {
+    expect(buildMentionText('hello\t', 6, userId)).toBe('pubkyuser123 ');
+  });
 });

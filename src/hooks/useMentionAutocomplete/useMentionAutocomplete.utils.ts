@@ -170,7 +170,7 @@ export function getContentWithMention(content: string, caret: number, userId: st
 export function buildMentionText(content: string, start: number, userId: string): string {
   const startIndex = clampCaret(content, start);
   const before = content.slice(0, startIndex);
-  const space = before.length > 0 && !before.endsWith(' ') ? ' ' : '';
+  const space = before.length > 0 && !/\s$/.test(before) ? ' ' : '';
   return `${space}${PUBKY_PREFIX}${userId} `;
 }
 
