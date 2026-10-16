@@ -282,7 +282,15 @@ export function usePostInput({
 
     const start = textarea.selectionStart ?? mentionCaret;
     const end = textarea.selectionEnd ?? start;
-    const inserted = buildMentionText(content, start, userId);
+
+    // Use textarea.value, not the React `content` state. The browser normalizes
+    // line endings (CRLF → LF) in the rendered value, so a share-target draft
+    // that came in as A\r\nB exposes A\nB in the DOM while `content` still holds
+    // the CRLF form. selectionStart/selectionEnd are offsets into the DOM value,
+    // so the separator and length checks must read the same string they index.
+    // The ?? content fallback only matters in tests without a real textarea.
+    const textareaValue = textarea.value ?? content;
+    const inserted = buildMentionText(textareaValue, start, userId);
 
     // Chromium's insertText clips at maxLength and returns true, silently
     // truncating the key. When the normalized mention cannot fit, let the
@@ -291,7 +299,7 @@ export function usePostInput({
     // the browser clips against); fall back to the composer constant when it is
     // unset (-1).
     const fieldLimit = textarea.maxLength > 0 ? textarea.maxLength : POST_MAX_CHARACTER_LENGTH;
-    if (content.length - (end - start) + inserted.length > fieldLimit) {
+    if (textareaValue.length - (end - start) + inserted.length > fieldLimit) {
       return false;
     }
 

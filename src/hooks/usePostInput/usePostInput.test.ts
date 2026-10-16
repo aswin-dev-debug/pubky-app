@@ -3631,6 +3631,53 @@ describe('usePostInput', () => {
       expect(pasteEvent.preventDefault).not.toHaveBeenCalled();
       expect(mockSetContent).not.toHaveBeenCalled();
     });
+
+    it('adds the separator when the textarea value differs from content by CRLF normalization', () => {
+      const validPubky = '8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo';
+      // content still holds the CRLF share-target draft; the DOM value has been
+      // normalized to LF by the browser.
+      mockContent = 'A\r\nB';
+
+      const { result } = renderHook(() =>
+        usePostInput({ variant: 'post' }),
+      );
+
+      result.current.textareaRef.current = asOpaque<HTMLTextAreaElement>({
+        value: 'A\nB',
+        selectionStart: 3,
+        selectionEnd: 3,
+        maxLength: 2000,
+        focus: vi.fn(),
+        setSelectionRange: vi.fn(),
+      });
+
+      const doc = document as Document & {
+        execCommand?: (cmd: string, ui?: boolean, value?: string) => boolean;
+      };
+      const original = doc.execCommand;
+      const execCommand = vi.fn().mockReturnValue(true);
+      doc.execCommand = execCommand;
+
+      try {
+        const pasteEvent = mockClipboardEvent({
+          clipboardData: asOpaque<DataTransfer>({ items: [], getData: () => validPubky }),
+          preventDefault: vi.fn(),
+        });
+
+        act(() => {
+          result.current.handlePaste(pasteEvent);
+        });
+
+        // Separator must be present — the char before the caret is `B`, not whitespace.
+        expect(execCommand).toHaveBeenCalledWith('insertText', false, ` pubky${validPubky} `);
+      } finally {
+        if (original === undefined) {
+          Reflect.deleteProperty(doc, 'execCommand');
+        } else {
+          doc.execCommand = original;
+        }
+      }
+    });
   });
   describe('mention autocomplete', () => {
     /** A real textarea so the hook can read the live selection, as the composer does */
