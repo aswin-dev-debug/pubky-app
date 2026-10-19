@@ -1,9 +1,16 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { initSync } from '@synonymdev/locks-sdk';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClientErrorCode, ServerErrorCode, ValidationErrorCode } from '@/libs/error/error.codes';
 import { Err } from '@/libs/error/error.factories';
+import { httpStatusCodeToError } from '@/libs/error/error.http';
 import { ErrorService } from '@/libs/error/error.types';
 import { Logger } from '@/libs/logger/logger';
 import { GuardedContentParser } from '@/pipes/locks/locks.parser';
+import {
+  HOMESERVER_PUBLISH_CONFLICT_MESSAGE,
+  installHomeserverWriteRetryDependenciesForTests,
+} from '@/services/homeserver/write-retry';
 import type { LockFile, ReplicatedPost, TGuardedResource, TUnlockedContent } from '@/services/locks/locks.types';
 import { MOCK_LOCK_AUTHOR_PUBKY, mockLockFile } from '@/test-utils/locks';
 import { asOpaque } from '@/test-utils/type-assertions';
@@ -11,7 +18,8 @@ import { LocksApplication } from './locks';
 
 const mocks = vi.hoisted(() => ({
   registerGuardedResource: vi.fn(),
-  createContentLock: vi.fn(),
+  creatorCreateContentLock: vi.fn(),
+  getLockSession: vi.fn(),
   randomUUID: vi.fn(),
   generateBundleId: vi.fn(),
   submitProof: vi.fn(),
@@ -41,6 +49,7 @@ vi.mock('@/services/local/locks/locks', () => ({
 
 vi.mock('@/services/homeserver/homeserver', () => ({
   HomeserverService: {
+    createWriteFence: () => ({ enter: () => {}, assertCurrent: () => {} }),
     putBlob: mocks.putBlob,
     getBytes: mocks.getBytes,
     getBytesIfExists: mocks.getBytesIfExists,
@@ -48,19 +57,33 @@ vi.mock('@/services/homeserver/homeserver', () => ({
   },
 }));
 
-vi.mock('@/services/locks/locks', () => ({
-  LocksService: {
-    registerGuardedResource: mocks.registerGuardedResource,
-    createContentLock: mocks.createContentLock,
-    generateBundleId: mocks.generateBundleId,
-    submitProof: mocks.submitProof,
-    lookupPaykitConnectionState: mocks.lookupPaykitConnectionState,
-    lookupVerificationTask: mocks.lookupVerificationTask,
-    issueAccessCredential: mocks.issueAccessCredential,
-    readContentLock: mocks.readContentLock,
-    proxyReadGuardedResource: mocks.proxyReadGuardedResource,
-  },
-}));
+vi.mock('@/services/locks/locks', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/locks/locks')>();
+  return {
+    LocksService: {
+      registerGuardedResource: mocks.registerGuardedResource,
+      // Publishing uses the production service and SDK builder; only creator transport is mocked.
+      createContentLock: actual.LocksService.createContentLock,
+      generateBundleId: mocks.generateBundleId,
+      submitProof: mocks.submitProof,
+      lookupPaykitConnectionState: mocks.lookupPaykitConnectionState,
+      lookupVerificationTask: mocks.lookupVerificationTask,
+      issueAccessCredential: mocks.issueAccessCredential,
+      readContentLock: mocks.readContentLock,
+      proxyReadGuardedResource: mocks.proxyReadGuardedResource,
+    },
+  };
+});
+
+vi.mock('@/services/locks/locks.utils', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/locks/locks.utils')>();
+  return {
+    ...actual,
+    // Initialize the installed web SDK's WASM from disk instead of fetching it in jsdom.
+    ensureLocksSdkReady: async () => {},
+    getLockSession: mocks.getLockSession,
+  };
+});
 
 beforeEach(() => {
   mocks.cacheGet.mockReset().mockResolvedValue(null);
@@ -69,26 +92,43 @@ beforeEach(() => {
 });
 
 const file = (contentType = 'application/json') => ({ contentType, bytes: new Uint8Array([1]) });
-const descriptor = (path: string) => ({ path, hash: 'HASH', content_type: 'application/json', size: 1 });
+const resourceMetadata = { hash: '07'.repeat(32), content_type: 'application/json', size: 1 };
+const descriptor = (path: string) => ({ path: `/priv/app.locks/content/${path}`, ...resourceMetadata });
 /** Default builder: ignores the attachment paths and returns a fixed post JSON. */
 const buildPost = () => file();
 const paymentConfig = { amount: '1000', asset: 'BTC' as const };
+const CREATOR_PUBKY = `pubky${MOCK_LOCK_AUTHOR_PUBKY}`;
+const LOCK_SERVER_PUBKY = 'pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo';
 
 describe('LocksApplication (content)', () => {
+  beforeAll(() => {
+    const sdkEntry = import.meta.resolve('@synonymdev/locks-sdk');
+    initSync({ module: readFileSync(new URL('./locks_sdk_wasm_bg.wasm', sdkEntry)) });
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getLockSession.mockReturnValue({
+      lockServer: () => LOCK_SERVER_PUBKY,
+      creator: { createContentLock: mocks.creatorCreateContentLock },
+    });
     let minted = 0;
     mocks.randomUUID.mockImplementation(() => `id-${++minted}`);
     vi.stubGlobal('crypto', { ...globalThis.crypto, randomUUID: mocks.randomUUID });
     mocks.registerGuardedResource.mockImplementation(({ path }: { path: string }) => ({
       resource: descriptor(path),
-      creator: 'pubkybob',
+      creator: CREATOR_PUBKY,
     }));
-    mocks.createContentLock.mockResolvedValue({
+    mocks.creatorCreateContentLock.mockReset().mockResolvedValue({
       lock_id: 'LOCK1',
       content_lock_path: '/pub/app.locks/LOCK1.json',
-      creator: 'pubkybob',
+      content_lock: { creator: CREATOR_PUBKY },
     });
+    mocks.readContentLock.mockReset().mockResolvedValue(mockLockFile({ creator: CREATOR_PUBKY }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('uploads the attachments first, then the post built from their paths', async () => {
@@ -109,15 +149,22 @@ describe('LocksApplication (content)', () => {
     // The builder sees the attachment descriptors, so the post can reference their paths.
     expect(seen).toEqual([[descriptor('id-1'), descriptor('id-2')]]);
     // ...and the owner the bytes landed on, so those references point at the right account.
-    expect(seenOwner).toBe('pubkybob');
+    expect(seenOwner).toBe(CREATOR_PUBKY);
 
-    expect(mocks.createContentLock).toHaveBeenCalledWith(
+    expect(mocks.creatorCreateContentLock).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        primaryResource: descriptor('id-3'),
-        secondaryResources: [descriptor('id-1'), descriptor('id-2')],
+        primary_resource: descriptor('id-3'),
+        secondary_resources: {
+          [descriptor('id-1').path]: resourceMetadata,
+          [descriptor('id-2').path]: resourceMetadata,
+        },
       }),
     );
-    expect(result).toEqual({ lock_id: 'LOCK1', content_lock_path: '/pub/app.locks/LOCK1.json', creator: 'pubkybob' });
+    expect(result).toEqual({
+      lock_id: 'LOCK1',
+      content_lock_path: '/pub/app.locks/LOCK1.json',
+      creator: CREATOR_PUBKY,
+    });
   });
 
   it('gives identical files distinct paths, so neither overwrites the other', async () => {
@@ -138,24 +185,28 @@ describe('LocksApplication (content)', () => {
 
     expect(builder).toHaveBeenCalledWith([], undefined);
     expect(mocks.registerGuardedResource).toHaveBeenCalledTimes(1);
-    expect(mocks.createContentLock).toHaveBeenCalledWith(expect.objectContaining({ secondaryResources: [] }));
+    expect(mocks.creatorCreateContentLock).toHaveBeenCalledOnce();
+    // The SDK omits secondary_resources when there are no attachments.
+    expect(mocks.creatorCreateContentLock.mock.calls[0][0]).not.toHaveProperty('secondary_resources');
   });
 
   it.each(['BTC', 'USD'] as const)('sends a %s payment criterion for the lock owner', async (asset) => {
     await LocksApplication.createLockContent({ buildPost, lockConfig: { amount: '1234', asset } });
 
-    const [params] = mocks.createContentLock.mock.calls[0];
+    expect(mocks.creatorCreateContentLock).toHaveBeenCalledOnce();
+    const [params] = mocks.creatorCreateContentLock.mock.calls[0];
     expect(params.criteria).toEqual([
       {
         criterion_id: 'criterion-1',
         verifier_type: 'paykit-payment',
         // The recipient comes from the upload response, not the pubky.app account.
-        params: { recipient_pubky: 'pubkybob', amount: '1234', asset },
+        params: { recipient_pubky: CREATOR_PUBKY, amount: '1234', asset, payment_in: 24 },
       },
     ]);
     // v1 wants that single criterion referenced exactly once.
-    expect(params.lockLogic).toEqual({ type: 'all', criteria: ['criterion-1'] });
-    expect(params.accessPolicy).toEqual({ requested_credential_ttl_seconds: 900 });
+    expect(params.lock_logic).toEqual({ type: 'all', criteria: ['criterion-1'] });
+    expect(params.access_policy).toEqual({ requested_credential_ttl_seconds: 900 });
+    expect(params.lock_server).toEqual({ override: LOCK_SERVER_PUBKY });
   });
 
   it('does not build the post or create the lock when an attachment upload fails', async () => {
@@ -171,30 +222,30 @@ describe('LocksApplication (content)', () => {
     ).rejects.toThrow('upload failed');
 
     expect(builder).not.toHaveBeenCalled();
-    expect(mocks.createContentLock).not.toHaveBeenCalled();
+    expect(mocks.creatorCreateContentLock).not.toHaveBeenCalled();
   });
 
   it('keeps a successful publication successful if the immediate descriptor read fails', async () => {
-    mocks.createContentLock.mockResolvedValue({
+    mocks.creatorCreateContentLock.mockResolvedValue({
       lock_id: 'LOCK1',
       content_lock_path: '/pub/locks.app/LOCK1.json',
-      creator: `pubky${MOCK_LOCK_AUTHOR_PUBKY}`,
+      content_lock: { creator: CREATOR_PUBKY },
     });
     mocks.readContentLock.mockRejectedValue(new Error('homeserver not ready'));
     await expect(LocksApplication.createLockContent({ buildPost, lockConfig: paymentConfig })).resolves.toMatchObject({
       lock_id: 'LOCK1',
     });
-    expect(mocks.createContentLock).toHaveBeenCalledOnce();
+    expect(mocks.creatorCreateContentLock).toHaveBeenCalledOnce();
     await vi.waitFor(() => expect(mocks.readContentLock).toHaveBeenCalledOnce());
   });
 
   it('caches the published descriptor and post without re-reading the guarded original', async () => {
     const creator = `pubky${MOCK_LOCK_AUTHOR_PUBKY}`;
     const publicFile = mockLockFile({ creator });
-    mocks.createContentLock.mockResolvedValue({
+    mocks.creatorCreateContentLock.mockResolvedValue({
       lock_id: 'LOCK1',
       content_lock_path: '/pub/locks.app/LOCK1.json',
-      creator,
+      content_lock: { creator },
     });
     mocks.readContentLock.mockResolvedValue(publicFile);
     const buildPost = () => ({
@@ -217,10 +268,10 @@ describe('LocksApplication (content)', () => {
 
   it('does not wait for the descriptor read before finishing publication', async () => {
     const creator = `pubky${MOCK_LOCK_AUTHOR_PUBKY}`;
-    mocks.createContentLock.mockResolvedValue({
+    mocks.creatorCreateContentLock.mockResolvedValue({
       lock_id: 'LOCK1',
       content_lock_path: '/pub/locks.app/LOCK1.json',
-      creator,
+      content_lock: { creator },
     });
     let resolveRead: (value: LockFile) => void = () => undefined;
     mocks.readContentLock.mockReturnValue(
@@ -689,6 +740,50 @@ describe('LocksApplication (payment unlock)', () => {
 
       await expect(LocksApplication.startPayment(params)).rejects.toThrow();
       expect(mocks.submitProof).not.toHaveBeenCalled();
+    });
+
+    describe('when the homeserver refuses the purchase-file PUT', () => {
+      const homeserverError = (body: string) =>
+        httpStatusCodeToError(
+          409,
+          `Request failed: Server responded with an error: 409 Conflict - ${body}`,
+          ErrorService.Homeserver,
+          'putBlob',
+          purchaseFile(BUNDLE_A),
+        );
+
+      beforeEach(() => {
+        installHomeserverWriteRetryDependenciesForTests({ sleep: async () => {}, random: () => 0 });
+        mocks.generateBundleId.mockResolvedValue(BUNDLE_A);
+      });
+
+      afterEach(() => {
+        installHomeserverWriteRetryDependenciesForTests(null);
+      });
+
+      // The conflict says the purchases changed after they were read; here the late write landed.
+      it('re-reads the purchases after the publish conflict and reuses the id that landed', async () => {
+        const saved: string[] = [];
+        mocks.listAll.mockImplementation(async () => [...saved]);
+        mocks.putBlob.mockImplementationOnce(async ({ url }: { url: string }) => {
+          saved.push(url);
+          throw homeserverError(HOMESERVER_PUBLISH_CONFLICT_MESSAGE);
+        });
+
+        await expect(LocksApplication.startPayment(params)).resolves.toEqual({ bundleId: BUNDLE_A, status: 'pending' });
+        expect(mocks.listAll).toHaveBeenCalledTimes(2);
+        expect(mocks.generateBundleId).toHaveBeenCalledOnce();
+        expect(mocks.putBlob).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ fence: expect.anything() }));
+        expect(mocks.submitProof).toHaveBeenCalledWith(expect.objectContaining({ bundle_id: BUNDLE_A }));
+      });
+
+      it('does not re-read or submit after a path collision', async () => {
+        mocks.putBlob.mockRejectedValueOnce(homeserverError('File/folder path collision'));
+
+        await expect(LocksApplication.startPayment(params)).rejects.toMatchObject({ context: { statusCode: 409 } });
+        expect(mocks.listAll).toHaveBeenCalledOnce();
+        expect(mocks.submitProof).not.toHaveBeenCalled();
+      });
     });
 
     // Fail closed: a saved file that cannot be read means a purchase exists and its id is lost.
